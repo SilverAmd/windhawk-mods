@@ -129,7 +129,7 @@ This mod does not read all HWiNFO sensors directly. It only reads values that HW
 
 This mod does not use HWiNFO Shared Memory.
 
-This is a separate mod because it reads HWiNFO Gadget/VSB Registry values instead of HWiNFO Shared Memory and includes an HTML registry export helper for mapping ValueN entries to Windhawk rows.
+This is a separate mod from Taskbar System Info and Desktop Live Overlay because it is focused on arbitrary user-selected HWiNFO Gadget/VSB Registry values. Taskbar System Info can use the HWiNFO Gadget Registry for limited taskbar temperature display, while Desktop Live Overlay provides generic desktop metrics. This mod instead provides a dedicated multi-row desktop table for HWiNFO ValueN entries, an HTML registry export helper for mapping those entries to Windhawk rows, and the optional Water Age row.
 
 HWiNFO must be installed and running, and the desired sensor values must be enabled for Gadget reporting in HWiNFO.
 
@@ -164,7 +164,10 @@ MIT
 /*
 - registryRoot: HKCU
   $name: Registry root
-  $description: Use HKCU or HKLM.
+  $description: "Select the registry root to read the HWiNFO Gadget/VSB values from."
+  $options:
+  - HKCU: HKEY_CURRENT_USER
+  - HKLM: HKEY_LOCAL_MACHINE
 
 - registryPath: SOFTWARE\HWiNFO64\VSB
   $name: Registry path
@@ -254,7 +257,7 @@ MIT
   $description: "X position of the vertical separator line."
 
 - columnSeparatorColor: "#FFFFFF"
-  $name: Column separator color #RRGGBB
+  $name: "Column separator color #RRGGBB"
   $description: "Vertical separator color. Alpha is ignored for GDI pens."
 
 - rowSpacing: 2
@@ -347,10 +350,10 @@ MIT
   $description: "Water age turns alarm color at this percentage."
 
 - waterAgeWarnColor: "#FFFFAA00"
-  $name: Water age warning color #FFFFAA00
+  $name: "Water age warning color #FFFFAA00"
 
 - waterAgeAlarmColor: "#FFFF3333"
-  $name: Water age alarm color #FFFF3333
+  $name: "Water age alarm color #FFFF3333"
 
 - waterAgeTopGap: 8
   $name: Water age top gap
@@ -361,19 +364,19 @@ MIT
   $description: "Draws a horizontal separator line above the water age row."
 
 - waterAgeSeparatorColor: "#FFFFFF"
-  $name: Water age separator color #RRGGBB
+  $name: "Water age separator color #RRGGBB"
   $description: "Horizontal separator color. Alpha is ignored for GDI pens."
 
 - textColor: "#FFFFFF"
-  $name: Fallback text color #RRGGBB
+  $name: "Fallback text color #RRGGBB"
   $description: "Fallback text color. #AARRGGBB is accepted, but alpha is ignored for GDI text."
 
 - labelColor: "#FF0000"
-  $name: Label color #RRGGBB
+  $name: "Label color #RRGGBB"
   $description: "Color for sensor labels, for example CPU W, GPU W, FLOW. Alpha is ignored for GDI text."
 
 - valueColor: "#00FF00"
-  $name: Value color #RRGGBB
+  $name: "Value color #RRGGBB"
   $description: "Color for sensor values, for example 53.2 W or 330.6 l/h. Alpha is ignored for GDI text."
 
 - backgroundEnabled: true
@@ -381,7 +384,7 @@ MIT
   $description: "When disabled, only the text is shown without background."
 
 - backgroundColor: "#304050"
-  $name: Background color #RRGGBB
+  $name: "Background color #RRGGBB"
   $description: "Background base color. Alpha from #AARRGGBB is ignored because backgroundOpacityPercent controls overlay opacity."
 
 - backgroundOpacityPercent: 90
@@ -393,7 +396,7 @@ MIT
   $description: "When enabled, the background is drawn as a gradient between background color and gradient color 2."
 
 - backgroundGradientColor2: "#507080"
-  $name: Background gradient color 2 #RRGGBB
+  $name: "Background gradient color 2 #RRGGBB"
   $description: "Second background gradient color. Alpha is ignored; use backgroundOpacityPercent."
 
 - backgroundGradientDirection: DiagonalUp
@@ -414,7 +417,7 @@ MIT
   $description: "Border size in pixels. 0 disables the border."
 
 - backgroundBorderColor: "#FFFFFF"
-  $name: Background border color #RRGGBB
+  $name: "Background border color #RRGGBB"
   $description: "Border color. Alpha is ignored for GDI pens."
 
 - hideUnavailableRows: false
@@ -436,6 +439,7 @@ MIT
 #include <windows.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <objbase.h>
 #include <string>
 #include <vector>
 #include <sstream>
@@ -1997,6 +2001,10 @@ DrawColumnSeparator(hdc, contentTopY, separatorBottomY);
             InvalidateRect(hwnd, nullptr, TRUE);
             return 0;
 
+        case WM_CAPTURECHANGED:
+            settings.dragging = false;
+            return 0;
+
         case WM_DESTROY:
             UnregisterHotKey(hwnd, HOTKEY_TOGGLE_OVERLAY);
             UnregisterHotKey(hwnd, HOTKEY_DRAG_MODE);
@@ -2077,6 +2085,12 @@ void ToggleOverlayVisibility(HWND hwnd) {
         hwnd,
         settings.overlayVisible ? SW_SHOWNOACTIVATE : SW_HIDE
     );
+
+    if (settings.overlayVisible) {
+        RefreshCachedRegistryValues();
+        ApplyOverlayWindowSize(hwnd);
+        InvalidateRect(hwnd, nullptr, FALSE);
+    }
 }
 
 UINT GetDragHotkeyModifiers() {
@@ -2209,8 +2223,15 @@ void UpdateClickThroughState(HWND hwnd) {
 }
 
 void ToggleDragMode(HWND hwnd) {
+    bool wasDragging = settings.dragging;
+
     settings.dragModeEnabled = !settings.dragModeEnabled;
     settings.dragging = false;
+
+    if (!settings.dragModeEnabled &&
+        (wasDragging || GetCapture() == hwnd)) {
+        ReleaseCapture();
+    }
 
     UpdateClickThroughState(hwnd);
 
@@ -2980,9 +3001,24 @@ DWORD WINAPI OverlayThreadProc(LPVOID) {
 
     SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
+    HRESULT coInitResult = CoInitializeEx(
+        nullptr,
+        COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE
+    );
+
+    bool comInitialized = SUCCEEDED(coInitResult);
+
+    if (FAILED(coInitResult) && coInitResult != RPC_E_CHANGED_MODE) {
+        Wh_Log(L"CoInitializeEx failed: %08X", coInitResult);
+    }
+
     if (!CreateOverlayWindow()) {
         Wh_Log(L"Failed to create overlay window in UI thread");
-        UnregisterClassW(OVERLAY_WINDOW_CLASS_NAME, GetCurrentModuleHandle());
+
+        if (comInitialized) {
+            CoUninitialize();
+        }
+
         return 1;
     }
 
@@ -2997,6 +3033,10 @@ DWORD WINAPI OverlayThreadProc(LPVOID) {
     }
 
     UnregisterClassW(OVERLAY_WINDOW_CLASS_NAME, GetCurrentModuleHandle());
+
+    if (comInitialized) {
+        CoUninitialize();
+    }
 
     return 0;
 }
